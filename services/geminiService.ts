@@ -1,6 +1,6 @@
 
-import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
-import { CodeFile } from "./githubService";
+import { GoogleGenAI, GenerateContentResponse, Type, Chat, Part, Content } from "@google/genai";
+import { CodeFile, RepoAnalysisData } from "./githubService";
 
 const API_KEY = process.env.API_KEY;
 
@@ -11,6 +11,7 @@ if (!API_KEY) {
 const ai = new GoogleGenAI({ apiKey: API_KEY });
 const model = "gemini-2.5-flash";
 
+// --- Interfaces ---
 export interface GroundingSource {
     web: {
         uri: string;
@@ -23,13 +24,29 @@ export interface RecommendedRepo {
     sources: GroundingSource[];
 }
 
-const callGemini = async (prompt: string): Promise<string> => {
+export interface VisualDocumentationData {
+    architectureDiagram: string;
+    dependencyGraph: string;
+    flowchart: string;
+    classDiagram: string;
+}
+
+export interface ChatMessage {
+    role: 'user' | 'model';
+    parts: Part[];
+}
+
+// --- Helper Functions ---
+
+const callGeminiWithRetry = async (prompt: string, isJson: boolean = false): Promise<any> => {
    try {
+    const config = isJson ? { responseMimeType: "application/json" } : {};
     const response = await ai.models.generateContent({
       model: model,
       contents: prompt,
+      config
     });
-    return response.text;
+    return isJson ? JSON.parse(response.text) : response.text;
   } catch (error) {
     console.error("Error calling Gemini API:", error);
     if (error instanceof Error) {
@@ -38,6 +55,8 @@ const callGemini = async (prompt: string): Promise<string> => {
     throw new Error("An unexpected error occurred while communicating with the Gemini API.");
   }
 }
+
+// --- Core Analysis Functions ---
 
 const ARCHITECTURE_PROMPT_TEMPLATE = `
 You are a principal software architect. Based on the file contents of these configuration and package management files, provide a concise summary of the project's architecture.
@@ -55,7 +74,7 @@ export const generateArchitecturalSummary = async (structuralFiles: CodeFile[]):
     }
     const filesContent = structuralFiles.map(file => `--- File: ${file.path} ---\n${file.content}`).join('\n\n');
     const prompt = ARCHITECTURE_PROMPT_TEMPLATE.replace('{{FILES_CONTENT}}', filesContent);
-    return callGemini(prompt);
+    return callGeminiWithRetry(prompt);
 };
 
 
@@ -80,7 +99,7 @@ export const reviewFileWithContext = async (file: CodeFile, architecturalSummary
     let prompt = FILE_REVIEW_PROMPT_TEMPLATE.replace('{{ARCHITECTURAL_SUMMARY}}', architecturalSummary);
     prompt = prompt.replace('{{FILE_PATH}}', file.path);
     prompt = prompt.replace('{{CODE}}', file.content);
-    return callGemini(prompt);
+    return callGeminiWithRetry(prompt);
 };
 
 const SYNTHESIS_PROMPT_TEMPLATE = `
@@ -97,8 +116,11 @@ Here are the individual file reviews to synthesize:
 
 export const synthesizeFinalReport = async (individualReviews: string): Promise<string> => {
     const prompt = SYNTHESIS_PROMPT_TEMPLATE.replace('{{INDIVIDUAL_REVIEWS}}', individualReviews);
-    return callGemini(prompt);
+    return callGeminiWithRetry(prompt);
 };
+
+
+// --- Post-Analysis Functions ---
 
 const RECOMMENDATION_PROMPT_TEMPLATE = `
 Based on the following code review report, act as a developer advocate and recommend 3-5 high-quality, open-source GitHub repositories that demonstrate best practices the user could learn from.
@@ -126,15 +148,142 @@ export const findRecommendedRepos = async (report: string): Promise<RecommendedR
         const text = response.text;
         const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
         
-        // Filter out sources that might be empty or invalid
-        const sources = groundingChunks.filter((chunk: any) => chunk.web && chunk.web.uri && chunk.web.title);
+        const sources: GroundingSource[] = groundingChunks
+            .filter(chunk => chunk.web && chunk.web.uri && chunk.web.title)
+            .map(chunk => ({
+                web: {
+                    uri: chunk.web!.uri!,
+                    title: chunk.web!.title!,
+                },
+            }));
         
         return { text, sources };
     } catch (error) {
         console.error("Error calling Gemini API with Google Search:", error);
-        if (error instanceof Error) {
-            throw new Error(`Gemini API Error: ${error.message}`);
-        }
+        if (error instanceof Error) throw new Error(`Gemini API Error: ${error.message}`);
         throw new Error("An unexpected error occurred while communicating with the Gemini API.");
     }
+};
+
+
+// --- Deep Wiki Functions ---
+
+const VISUAL_DOCS_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    architectureDiagram: {
+      type: Type.STRING,
+      description: "Mermaid syntax for a C4-style component diagram showing the main components and their relationships.",
+    },
+    dependencyGraph: {
+      type: Type.STRING,
+      description: "Mermaid syntax for a graph showing dependencies between the analyzed files.",
+    },
+    flowchart: {
+      type: Type.STRING,
+      description: "Mermaid syntax for a flowchart illustrating a primary user flow or data process.",
+    },
+    classDiagram: {
+        type: Type.STRING,
+        description: "Mermaid syntax for a class diagram for any object-oriented structures found. Can be an empty string if not applicable."
+    }
+  },
+  required: ["architectureDiagram", "dependencyGraph", "flowchart", "classDiagram"]
+};
+
+const VISUAL_DOCS_PROMPT = `
+You are a software documentation specialist. Analyze the provided repository context, including the architectural summary and file contents, to generate visual diagrams.
+Produce Mermaid.js syntax for each of the requested diagram types.
+- For the architecture diagram, focus on the main software components and their interactions.
+- For the dependency graph, show how the provided files import or depend on one another.
+- For the flowchart, pick a single, critical process (like user registration, data processing, or the main application loop) and map it out.
+- For the class diagram, represent the primary classes and their inheritance/composition relationships. If the code is not object-oriented, you may return an empty string for this diagram.
+The output must be a valid JSON object matching the specified schema.
+
+Architectural Summary:
+---
+{{ARCHITECTURAL_SUMMARY}}
+---
+Repository Files:
+---
+{{FILES_CONTENT}}
+---
+`;
+
+export const generateVisualDocumentation = async (repoData: RepoAnalysisData, architecturalSummary: string): Promise<VisualDocumentationData> => {
+    const allFiles = [...repoData.structuralFiles, ...repoData.codeFiles];
+    const filesContent = allFiles.map(file => `--- File: ${file.path} ---\n${file.content}`).join('\n\n');
+    let prompt = VISUAL_DOCS_PROMPT.replace('{{ARCHITECTURAL_SUMMARY}}', architecturalSummary);
+    prompt = prompt.replace('{{FILES_CONTENT}}', filesContent);
+
+    const response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+            responseMimeType: "application/json",
+            responseSchema: VISUAL_DOCS_SCHEMA
+        }
+    });
+
+    return JSON.parse(response.text);
+};
+
+
+const CHAT_SYSTEM_PROMPT = `
+You are "DeepWiki", a conversational AI assistant for codebases.
+You have been provided with comprehensive context about a GitHub repository, including:
+1. An architectural summary.
+2. The contents of key files.
+3. A full code review report.
+4. Mermaid.js diagrams illustrating the architecture, dependencies, and flows.
+
+Your primary purpose is to answer user questions about the repository based on this context. Be helpful, accurate, and concise.
+When a question refers to a diagram, reference it by name (e.g., "In the Architecture Diagram...").
+Do not go outside the provided context. If a question cannot be answered with the given information, say so politely.
+
+Full Repository Context:
+---
+Architectural Summary:
+{{ARCHITECTURAL_SUMMARY}}
+
+Visual Documentation (Mermaid Syntax):
+{{VISUAL_DOCS}}
+
+Repository Files:
+{{FILES_CONTENT}}
+---
+`;
+
+export const startOrContinueChat = async (
+    history: ChatMessage[],
+    repoData: RepoAnalysisData,
+    architecturalSummary: string,
+    visualDocs: VisualDocumentationData
+): Promise<string> => {
+    
+    const allFiles = [...repoData.structuralFiles, ...repoData.codeFiles];
+    const filesContent = allFiles.map(file => `--- File: ${file.path} ---\n${file.content}`).join('\n\n');
+    const visualDocsString = JSON.stringify(visualDocs, null, 2);
+
+    let systemInstruction = CHAT_SYSTEM_PROMPT.replace('{{ARCHITECTURAL_SUMMARY}}', architecturalSummary);
+    systemInstruction = systemInstruction.replace('{{VISUAL_DOCS}}', visualDocsString);
+    systemInstruction = systemInstruction.replace('{{FILES_CONTENT}}', filesContent);
+
+    const chat: Chat = ai.chats.create({
+        model: model,
+        config: {
+            systemInstruction: systemInstruction,
+        },
+        // The Gemini `history` format is slightly different, so we map our state to it.
+        history: history.slice(0, -1).map(msg => ({
+            role: msg.role,
+            parts: msg.parts
+        }))
+    });
+
+    const lastMessage = history[history.length - 1];
+    
+    const result: GenerateContentResponse = await chat.sendMessage({ message: lastMessage.parts });
+    
+    return result.text;
 };
